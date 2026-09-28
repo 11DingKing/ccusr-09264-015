@@ -28,6 +28,7 @@ from ..domain.fingerprint import review_record_fingerprint
 from ..domain.models import Objection, ReviewRequest, User
 from ..application.timeutil import now_is_past, resolve_deadline
 from .base import Service, require_roles
+from .quality_service import latest_inspection_blocks
 
 
 class ReviewService(Service):
@@ -323,6 +324,17 @@ class ReviewService(Service):
             completed = [r for r in requests if r.status == RequestStatus.COMPLETED.value]
             if not completed:
                 raise ConflictError("尚无评审人完成评审，不能签发")
+            # 内容质量异常：最近一次检查为阻断级时禁止签发；
+            # 警告不阻断；修复后重新检查得到 pass/warning 即放行（旧记录保留）。
+            blocking = latest_inspection_blocks(self.repo, package_id)
+            if blocking is not None:
+                raise ConflictError(
+                    "最近一次内容质量检查存在阻断级异常，修复并重新检查后才能签发",
+                    details={
+                        "inspection_id": blocking.inspection_id,
+                        "checked_at": blocking.checked_at,
+                    },
+                )
             if decision == Decision.APPROVED.value:
                 if any(r.verdict == Verdict.OBJECT.value for r in completed):
                     raise ConflictError("存在反对结论，不能签发通过")

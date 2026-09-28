@@ -127,6 +127,46 @@ class Objection:
     created_at: str
 
 
+@dataclass(frozen=True)
+class QualityFinding:
+    """一次质量检查中发现的【一条】内容质量异常。
+
+    异常记录不可变：修复后重新检查会产生新的检查记录，
+    原异常原样保留，绝不被覆盖或删除。
+    """
+
+    finding_id: str
+    inspection_id: str
+    package_id: str
+    institution_id: str
+    severity: str                  # QualitySeverity：warning / blocking
+    category: str                  # 异常类别（如 材料缺失 / 数据矛盾）
+    detail: str
+    material_id: Optional[str]     # 可定位到具体材料/版本，也可针对整包
+    version_id: Optional[str]
+    created_by: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class QualityInspection:
+    """一次质量检查的不可变结果（含其下全部异常）。
+
+    每次执行检查都 INSERT 一条新记录；result 按本次发现的最高等级
+    写入（blocking > warning > pass）。历史检查永远保留。
+    """
+
+    inspection_id: str
+    package_id: str
+    institution_id: str
+    result: str                    # QualityCheckResult：pass / warning / blocked
+    checked_by: str
+    checked_at: str
+    note: Optional[str]
+    findings: tuple[QualityFinding, ...] = ()
+    fingerprint: Optional[str] = None  # 结果与全部异常的规范化哈希，离线核验重算
+
+
 @dataclass
 class Blob:
     sha256: str

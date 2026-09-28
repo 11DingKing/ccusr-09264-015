@@ -198,5 +198,142 @@ class HttpApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
 
 
+class QualityHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.h = Harness()
+        self.server = HttpApiServer(
+            self.h.ctx, host="127.0.0.1", port=0, bootstrap_token="boot-secret"
+        )
+        self.server.start()
+        host, port = self.server.address
+        self.base = f"http://{host}:{port}"
+        self.boot = ApiClient(self.base, bootstrap="boot-secret")
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        self.h.close()
+
+    def _user(self, user_id, roles, institution_id="inst-a", token=None):
+        status, _ = self.boot.request(
+            "POST", "/v1/admin/users",
+            {"user_id": user_id, "roles": roles,
+             "institution_id": institution_id},
+        )
+        self.assertEqual(status, 201)
+        if token:
+            status, _ = self.boot.request(
+                "POST", "/v1/admin/tokens",
+                {"user_id": user_id, "token": token},
+            )
+            self.assertEqual(status, 201)
+        return ApiClient(self.base, token=token)
+
+    def _sealed_package(self, admin) -> str:
+        import base64
+
+        status, mat = admin.request(
+            "POST", "/v1/materials",
+            {"kind": "syllabus", "title": "大纲"},
+        )
+        self.assertEqual(status, 201)
+        status, ver = admin.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": base64.b64encode(b"syllabus-v1").decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+        status, pkg = admin.request("POST", "/v1/packages", {"title": "秋评"})
+        pid = pkg["package_id"]
+        status, _ = admin.request(
+            "POST", f"/v1/packages/{pid}/entries",
+            {"version_id": ver["version_id"]},
+        )
+        self.assertEqual(status, 201)
+        status, _ = admin.request("POST", f"/v1/packages/{pid}/seal", {})
+        self.assertEqual(status, 200)
+        return pid
+
+    def test_quality_inspection_lifecycle_over_http(self) -> None:
+        admin = self._user("admin-a", ["institution_admin"], token="tok-admin")
+        inspector = self._user("insp-a", ["quality_inspector"], token="tok-insp")
+        authority = self._user(
+            "auth", ["quality_authority"], institution_id=None, token="tok-auth"
+        )
+        reviewer = self._user(
+            "rev-1", ["reviewer"], institution_id="inst-ext", token="tok-rev"
+        )
+        pid = self._sealed_package(admin)
+
+        # 无角色不能归档
+        status, body = admin.request(
+            "POST", f"/v1/packages/{pid}/inspections", {"findings": []}
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "permission_denied")
+
+        # 首次检查：阻断级异常
+        status, first = inspector.request(
+            "POST", f"/v1/packages/{pid}/inspections",
+            {"findings": [
+                {"severity": "blocking", "category": "材料缺失",
+                 "detail": "缺少评分标准"}
+            ], "note": "首次检查"},
+        )
+        self.assertEqual(status, 201, first)
+        self.assertEqual(first["result"], "blocked")
+        self.assertEqual(len(first["findings"]), 1)
+
+        # 非法等级
+        status, body = inspector.request(
+            "POST", f"/v1/packages/{pid}/inspections",
+            {"findings": [{"severity": "fatal", "category": "x", "detail": "y"}]},
+        )
+        self.assertEqual(status, 422)
+
+        # 修复后重新检查：产生新记录
+        status, second = inspector.request(
+            "POST", f"/v1/packages/{pid}/inspections", {"findings": []}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second["result"], "pass")
+        self.assertNotEqual(first["inspection_id"], second["inspection_id"])
+
+        # 历史：两条都在，原异常未被覆盖
+        status, listing = inspector.request(
+            "GET", f"/v1/packages/{pid}/inspections"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["count"], 2)
+        self.assertEqual(listing["latest_result"], "pass")
+        self.assertEqual(
+            [i["result"] for i in listing["inspections"]], ["blocked", "pass"]
+        )
+        status, old = inspector.request(
+            "GET", f"/v1/inspections/{first['inspection_id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(old["findings"][0]["severity"], "blocking")
+
+        # 阻断解除后完成评审并签发
+        status, req = authority.request(
+            "POST", f"/v1/packages/{pid}/assignments",
+            {"reviewer_id": "rev-1"},
+        )
+        self.assertEqual(status, 201)
+        rid = req["request_id"]
+        status, _ = reviewer.request(
+            "POST", f"/v1/requests/{rid}/respond", {"accept": True}
+        )
+        self.assertEqual(status, 200)
+        status, _ = reviewer.request(
+            "POST", f"/v1/requests/{rid}/verdict", {"verdict": "approve"}
+        )
+        self.assertEqual(status, 200)
+        status, decision = authority.request(
+            "POST", f"/v1/packages/{pid}/decision", {"decision": "approved"}
+        )
+        self.assertEqual(status, 200, decision)
+        self.assertEqual(decision["decision"], "approved")
+
+
 if __name__ == "__main__":
     unittest.main()

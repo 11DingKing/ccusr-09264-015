@@ -123,3 +123,42 @@ def is_valid_digest(value: str) -> bool:
     if algo != ALGORITHM:
         return False
     return len(hexdigest) == 64 and all(c in "0123456789abcdef" for c in hexdigest)
+
+
+def inspection_fingerprint(
+    inspection_id: str,
+    package_id: str,
+    result: str,
+    checked_by: str,
+    checked_at: str,
+    findings: Iterable[Mapping[str, Any]],
+) -> str:
+    """质量检查结果指纹。
+
+    每次检查独立成记录；指纹覆盖检查结论与全部异常明细，任何事后
+    改写（等级、类别、内容、增删异常）都会被离线核验发现。
+    """
+    norm_findings = sorted(
+        (
+            {
+                "finding_id": str(f["finding_id"]),
+                "severity": str(f["severity"]),
+                "category": str(f["category"]),
+                "detail": str(f["detail"]),
+                "material_id": f.get("material_id"),
+                "version_id": f.get("version_id"),
+            }
+            for f in findings
+        ),
+        key=lambda f: f["finding_id"],
+    )
+    payload = {
+        "schema": "quality-evidence-inspection/v1",
+        "inspection_id": inspection_id,
+        "package_id": package_id,
+        "result": result,
+        "checked_by": checked_by,
+        "checked_at": checked_at,
+        "findings": norm_findings,
+    }
+    return ALGORITHM + ":" + digest_json(payload)

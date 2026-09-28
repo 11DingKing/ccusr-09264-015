@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 
 from ..domain.fingerprint import (
     digest_bytes,
+    inspection_fingerprint,
     manifest_fingerprint,
     review_record_fingerprint,
 )
+from ..domain.enums import QualityCheckResult, QualitySeverity
 
 
 @dataclass
@@ -23,6 +25,7 @@ class VerificationReport:
     package_count: int = 0
     sealed_count: int = 0
     decided_count: int = 0
+    inspection_count: int = 0
     withdrawn_in_sealed: list[dict] = field(default_factory=list)
     failures: list[dict] = field(default_factory=list)
     warnings: list[dict] = field(default_factory=list)
@@ -45,6 +48,7 @@ class VerificationReport:
             "package_count": self.package_count,
             "sealed_count": self.sealed_count,
             "decided_count": self.decided_count,
+            "inspection_count": self.inspection_count,
             "withdrawn_in_sealed": self.withdrawn_in_sealed,
             "failures": self.failures,
             "warnings": self.warnings,
@@ -59,6 +63,7 @@ def verify_database(path: str) -> VerificationReport:
     try:
         _verify_blobs(conn, report)
         _verify_packages(conn, report)
+        _verify_inspections(conn, report)
     finally:
         conn.close()
     return report
@@ -241,3 +246,93 @@ def _verify_packages(conn: sqlite3.Connection, report: VerificationReport) -> No
                     stored=pkg["review_fingerprint"],
                     expected=expected_review,
                 )
+
+
+def _verify_inspections(conn: sqlite3.Connection, report: VerificationReport) -> None:
+    """重算每次质量检查的指纹；旧版本数据库可能尚无该表（只读打开不迁移）。"""
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "quality_inspections" not in tables:
+        return
+
+    inspections = conn.execute(
+        "SELECT * FROM quality_inspections ORDER BY checked_at, inspection_id"
+    ).fetchall()
+    report.inspection_count = len(inspections)
+    valid_results = {r.value for r in QualityCheckResult}
+    valid_severities = {s.value for s in QualitySeverity}
+
+    for ins in inspections:
+        findings = conn.execute(
+            "SELECT * FROM quality_findings WHERE inspection_id = ?"
+            " ORDER BY finding_id",
+            (ins["inspection_id"],),
+        ).fetchall()
+
+        severities = set()
+        for f in findings:
+            if f["inspection_id"] != ins["inspection_id"]:
+                report.fail(
+                    "finding_inspection_mismatch",
+                    finding_id=f["finding_id"],
+                    inspection_id=ins["inspection_id"],
+                )
+            if f["severity"] not in valid_severities:
+                report.fail(
+                    "finding_severity_invalid",
+                    inspection_id=ins["inspection_id"],
+                    finding_id=f["finding_id"],
+                    severity=f["severity"],
+                )
+            severities.add(f["severity"])
+
+        # result 必须与异常等级一致（blocking > warning > pass）
+        if QualitySeverity.BLOCKING.value in severities:
+            expected_result = QualityCheckResult.BLOCKED.value
+        elif QualitySeverity.WARNING.value in severities:
+            expected_result = QualityCheckResult.WARNING.value
+        else:
+            expected_result = QualityCheckResult.PASS.value
+        if ins["result"] not in valid_results:
+            report.fail(
+                "inspection_result_invalid",
+                inspection_id=ins["inspection_id"],
+                result=ins["result"],
+            )
+        elif ins["result"] != expected_result:
+            report.fail(
+                "inspection_result_mismatch",
+                inspection_id=ins["inspection_id"],
+                stored=ins["result"],
+                expected=expected_result,
+            )
+
+        expected_fp = inspection_fingerprint(
+            ins["inspection_id"],
+            ins["package_id"],
+            ins["result"],
+            ins["checked_by"],
+            ins["checked_at"],
+            [
+                {
+                    "finding_id": f["finding_id"],
+                    "severity": f["severity"],
+                    "category": f["category"],
+                    "detail": f["detail"],
+                    "material_id": f["material_id"],
+                    "version_id": f["version_id"],
+                }
+                for f in findings
+            ],
+        )
+        if ins["fingerprint"] != expected_fp:
+            report.fail(
+                "inspection_fingerprint_mismatch",
+                inspection_id=ins["inspection_id"],
+                stored=ins["fingerprint"],
+                expected=expected_fp,
+            )

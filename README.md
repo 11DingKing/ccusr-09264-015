@@ -37,6 +37,22 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 内容质量异常（警告 / 阻断）
+- 质检员（`quality_inspector`，质量权威亦可）对评审包归档检查结果；
+  异常分两级：**warning（警告，不阻断）** 与 **blocking（阻断，必须
+  修复后重新检查）**。一次检查的结果取本次发现的最高等级
+  （blocking > warning > pass）。
+- 检查结果与异常写入 `quality_inspections` / `quality_findings` 两张
+  **只追加**表：只有 INSERT，没有任何 UPDATE/DELETE 路径。修复后重新
+  检查（Python 重跑）必定产生**新记录**；原异常原样保留，可按时间序列
+  回看“每次检查当时查出了什么”，历史永不被覆盖（同 `Idempotency-Key`
+  的重试仍按既有规则回放首次结果，不产生重复行）。
+- 业务效果：包的**最近一次**检查为 blocked 时拒绝签发（409）；warning
+  不阻断；修复后重新检查得到 pass/warning 即放行，旧 blocked 留痕。
+- 每条检查结果带规范化 **inspection_fingerprint**（覆盖等级、类别、
+  内容、定位材料），离线核验重算；事后改写等级/内容或删除异常都会被
+  判为完整性失败。
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -51,7 +67,7 @@
 ```
 service_09252_006/
   domain/        实体、枚举、错误、指纹纯函数、披露策略
-  application/   用例服务（证据/评审包/评审）、端口（Clock、Id、Repository）
+  application/   用例服务（证据/评审包/评审/质量检查）、端口（Clock、Id、Repository）
   persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址）
   api/           HTTP 边界（Bearer 鉴权、路由、JSON 编解码）
   cli.py         serve / 离线 verify
@@ -106,6 +122,9 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/packages/{id}/inspections` | 质检员归档质量检查（findings：warning/blocking） |
+| GET  | `/v1/packages/{id}/inspections` | 该包全部历史检查（时间序，只追加） |
+| GET  | `/v1/inspections/{id}` | 单次检查及其异常明细 |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -120,7 +139,11 @@ python3 -m compileall -q service_09252_006 tests
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
-端到端流程。
+多连接**并发复审**、离线核验对字节/清单/评审/质量检查篡改的检出，以及
+完整 HTTP 端到端流程。
+
+内容质量异常另覆盖：警告/阻断两级与结果定级、修复后重新检查只追加不覆盖
+（含关闭重开数据库与相同内容重跑）、阻断拦截签发且复检通过后放行、
+幂等键不产生重复行、检查指纹的篡改/删改检出。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

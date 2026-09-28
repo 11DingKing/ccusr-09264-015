@@ -16,6 +16,8 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    QualityFinding,
+    QualityInspection,
     ReviewPackage,
     ReviewRequest,
     User,
@@ -148,3 +150,15 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 内容质量检查（只追加：不提供更新/删除方法）----
+    @abc.abstractmethod
+    def insert_inspection(self, inspection: QualityInspection) -> None:
+        """追加一次质量检查结果及其异常；历史记录永不被覆盖。"""
+
+    @abc.abstractmethod
+    def get_inspection(self, inspection_id: str) -> QualityInspection | None: ...
+
+    @abc.abstractmethod
+    def list_inspections(self, package_id: str | None = None) -> list[QualityInspection]:
+        """按检查时间升序返回（最新在最后），可按包过滤。"""

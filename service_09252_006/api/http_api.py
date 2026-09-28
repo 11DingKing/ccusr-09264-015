@@ -394,6 +394,31 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ------------------------------------------------------- 内容质量检查
+    def create_inspection(self, package_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.quality.record_inspection(
+            actor,
+            package_id=package_id,
+            findings=body.get("findings") or [],
+            note=body.get("note"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_inspections(self, package_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.quality.list_inspections(actor, package_id)
+        )
+
+    def get_inspection(self, inspection_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.quality.get_inspection(actor, inspection_id)
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -409,6 +434,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages/{package_id}/seal", "seal_package"),
         ("/v1/packages/{package_id}/assignments", "assign"),
         ("/v1/packages/{package_id}/decision", "issue_decision"),
+        ("/v1/packages/{package_id}/inspections", "create_inspection"),
         ("/v1/requests/{request_id}/cancel", "cancel_request"),
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
@@ -420,6 +446,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
+        ("/v1/packages/{package_id}/inspections", "list_inspections"),
+        ("/v1/inspections/{inspection_id}", "get_inspection"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",

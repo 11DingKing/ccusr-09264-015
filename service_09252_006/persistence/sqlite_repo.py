@@ -22,12 +22,14 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    QualityFinding,
+    QualityInspection,
     ReviewPackage,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -49,11 +51,10 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
+        if version < 1:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     user_id        TEXT PRIMARY KEY,
                     institution_id TEXT,
@@ -177,6 +178,47 @@ class SqliteRepository(Repository):
                 );
 
                 PRAGMA user_version = 1;
+            """
+        )
+        if version < 2:
+            # 内容质量异常：检查结果与异常均为只追加表。
+            # 没有任何 UPDATE/DELETE 路径——修复后重新检查只产生新记录，
+            # 原异常原样保留（历史可证、不被覆盖）。
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS quality_inspections (
+                    inspection_id TEXT PRIMARY KEY,
+                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
+                    institution_id TEXT NOT NULL,
+                    result        TEXT NOT NULL,
+                    checked_by    TEXT NOT NULL,
+                    checked_at    TEXT NOT NULL,
+                    note          TEXT,
+                    fingerprint   TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_qinspections_package
+                    ON quality_inspections(package_id, checked_at);
+
+                CREATE TABLE IF NOT EXISTS quality_findings (
+                    finding_id    TEXT PRIMARY KEY,
+                    inspection_id TEXT NOT NULL
+                        REFERENCES quality_inspections(inspection_id),
+                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
+                    institution_id TEXT NOT NULL,
+                    severity      TEXT NOT NULL,
+                    category      TEXT NOT NULL,
+                    detail        TEXT NOT NULL,
+                    material_id   TEXT,
+                    version_id    TEXT,
+                    created_by    TEXT NOT NULL,
+                    created_at    TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_qfindings_inspection
+                    ON quality_findings(inspection_id);
+                CREATE INDEX IF NOT EXISTS idx_qfindings_package
+                    ON quality_findings(package_id, severity);
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -667,6 +709,91 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ------------------------------------------------- 内容质量检查（只追加）
+    def insert_inspection(self, inspection: QualityInspection) -> None:
+        """插入一次检查及其全部异常；重复 inspection_id 被拒绝（禁止覆盖历史）。"""
+        self._conn.execute(
+            "INSERT INTO quality_inspections(inspection_id, package_id,"
+            " institution_id, result, checked_by, checked_at, note, fingerprint)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (
+                inspection.inspection_id,
+                inspection.package_id,
+                inspection.institution_id,
+                inspection.result,
+                inspection.checked_by,
+                inspection.checked_at,
+                inspection.note,
+                inspection.fingerprint,
+            ),
+        )
+        self._conn.executemany(
+            "INSERT INTO quality_findings(finding_id, inspection_id, package_id,"
+            " institution_id, severity, category, detail, material_id, version_id,"
+            " created_by, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    f.finding_id,
+                    f.inspection_id,
+                    f.package_id,
+                    f.institution_id,
+                    f.severity,
+                    f.category,
+                    f.detail,
+                    f.material_id,
+                    f.version_id,
+                    f.created_by,
+                    f.created_at,
+                )
+                for f in inspection.findings
+            ],
+        )
+
+    def _row_to_inspection(
+        self, row: sqlite3.Row, *, with_findings: bool
+    ) -> QualityInspection:
+        findings: tuple[QualityFinding, ...] = ()
+        if with_findings:
+            frows = self._conn.execute(
+                "SELECT * FROM quality_findings WHERE inspection_id = ?"
+                " ORDER BY finding_id",
+                (row["inspection_id"],),
+            ).fetchall()
+            findings = tuple(_row_to_finding(r) for r in frows)
+        return QualityInspection(
+            inspection_id=row["inspection_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            result=row["result"],
+            checked_by=row["checked_by"],
+            checked_at=row["checked_at"],
+            note=row["note"],
+            findings=findings,
+        )
+
+    def get_inspection(self, inspection_id: str) -> QualityInspection | None:
+        row = self._conn.execute(
+            "SELECT * FROM quality_inspections WHERE inspection_id = ?",
+            (inspection_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_inspection(row, with_findings=True)
+
+    def list_inspections(
+        self, package_id: str | None = None,
+    ) -> list[QualityInspection]:
+        if package_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM quality_inspections ORDER BY checked_at, inspection_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM quality_inspections WHERE package_id = ?"
+                " ORDER BY checked_at, inspection_id",
+                (package_id,),
+            ).fetchall()
+        return [self._row_to_inspection(r, with_findings=True) for r in rows]
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +843,20 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_finding(row: sqlite3.Row) -> QualityFinding:
+    return QualityFinding(
+        finding_id=row["finding_id"],
+        inspection_id=row["inspection_id"],
+        package_id=row["package_id"],
+        institution_id=row["institution_id"],
+        severity=row["severity"],
+        category=row["category"],
+        detail=row["detail"],
+        material_id=row["material_id"],
+        version_id=row["version_id"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
     )

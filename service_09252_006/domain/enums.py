@@ -9,6 +9,7 @@ class Role(str, Enum):
     INSTITUTION_SUBMITTER = "institution_submitter"
     REVIEWER = "reviewer"
     QUALITY_AUTHORITY = "quality_authority"
+    QUALITY_INSPECTOR = "quality_inspector"  # 质检员：归档内容质量异常
     AUDITOR = "auditor"
 
 
@@ -49,3 +50,18 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class QualitySeverity(str, Enum):
+    """内容质量异常等级：警告不阻断流程，阻断要求修复后重新检查。"""
+
+    WARNING = "warning"    # 警告：记录但不阻断
+    BLOCKING = "blocking"  # 阻断：必须修复并重新检查
+
+
+class QualityCheckResult(str, Enum):
+    """单次质量检查结论。"""
+
+    PASS = "pass"        # 未发现异常
+    WARNING = "warning"  # 存在警告级异常，不阻断
+    BLOCKED = "blocked"  # 存在阻断级异常
