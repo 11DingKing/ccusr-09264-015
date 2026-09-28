@@ -125,6 +125,12 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _idempotency_key(self) -> str | None:
         return self.headers.get("Idempotency-Key")
 
+    def _query(self) -> dict[str, str]:
+        from urllib.parse import parse_qs
+
+        parsed = parse_qs(urlparse(self.path).query)
+        return {k: v[-1] for k, v in parsed.items() if v}
+
     def _actor(self) -> User:
         from ..domain.errors import PermissionDeniedError
 
@@ -394,6 +400,79 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ------------------------------------------------------- 内容质量异常
+    def archive_anomaly(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.quality.archive_anomaly(
+            actor,
+            subject_type=body["subject_type"],
+            subject_id=body["subject_id"],
+            check_code=body["check_code"],
+            level=body["level"],
+            detail=body.get("detail", ""),
+            evidence=body.get("evidence"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def get_anomaly(self, anomaly_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.quality.get_anomaly(actor, anomaly_id)
+        )
+
+    def list_anomalies(self) -> None:
+        actor = self._actor()
+        qs = self._query()
+        self._send_json(
+            200,
+            self.services.quality.list_anomalies(
+                actor,
+                subject_type=qs.get("subject_type"),
+                subject_id=qs.get("subject_id"),
+                level=qs.get("level"),
+            ),
+        )
+
+    def record_check(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.quality.record_check(
+            actor,
+            subject_type=body["subject_type"],
+            subject_id=body["subject_id"],
+            findings=body.get("findings"),
+            note=body.get("note", ""),
+            subject_digest=body.get("subject_digest"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_checks(self) -> None:
+        actor = self._actor()
+        qs = self._query()
+        self._send_json(
+            200,
+            self.services.quality.list_check_runs(
+                actor,
+                subject_type=qs.get("subject_type"),
+                subject_id=qs.get("subject_id"),
+            ),
+        )
+
+    def quality_history(self) -> None:
+        actor = self._actor()
+        qs = self._query()
+        self._send_json(
+            200,
+            self.services.quality.subject_history(
+                actor,
+                subject_type=qs["subject_type"],
+                subject_id=qs["subject_id"],
+            ),
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +492,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/quality/anomalies", "archive_anomaly"),
+        ("/v1/quality/checks", "record_check"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +505,10 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/quality/anomalies", "list_anomalies"),
+        ("/v1/quality/anomalies/{anomaly_id}", "get_anomaly"),
+        ("/v1/quality/checks", "list_checks"),
+        ("/v1/quality/history", "quality_history"),
     ]
     return {"POST": post, "GET": get}
 

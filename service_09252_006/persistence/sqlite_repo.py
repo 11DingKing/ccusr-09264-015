@@ -22,12 +22,14 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    QualityAnomaly,
+    QualityCheckRun,
     ReviewPackage,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -176,7 +178,73 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                -- 内容质量异常：归档事件，仅追加，禁止更新/删除（见触发器）
+                CREATE TABLE IF NOT EXISTS quality_anomalies (
+                    anomaly_id    TEXT PRIMARY KEY,
+                    subject_type  TEXT NOT NULL,
+                    subject_id    TEXT NOT NULL,
+                    check_code    TEXT NOT NULL,
+                    level         TEXT NOT NULL CHECK (level IN ('warning','blocking')),
+                    detail        TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    archivist_id  TEXT NOT NULL,
+                    archived_at   TEXT NOT NULL,
+                    fingerprint   TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_anomalies_subject
+                    ON quality_anomalies(subject_type, subject_id, archived_at);
+
+                -- 质量检查结果：每次执行（含 Python 重跑）一行，仅追加
+                CREATE TABLE IF NOT EXISTS quality_check_runs (
+                    run_id         TEXT PRIMARY KEY,
+                    subject_type   TEXT NOT NULL,
+                    subject_id     TEXT NOT NULL,
+                    subject_digest TEXT NOT NULL,
+                    outcome        TEXT NOT NULL
+                        CHECK (outcome IN ('ok','warning','blocking')),
+                    warning_count  INTEGER NOT NULL,
+                    blocking_count INTEGER NOT NULL,
+                    checked_by     TEXT NOT NULL,
+                    checked_at     TEXT NOT NULL,
+                    note           TEXT NOT NULL DEFAULT '',
+                    fingerprint    TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_check_runs_subject
+                    ON quality_check_runs(subject_type, subject_id, checked_at);
+
+                -- 检查运行与当次仍发现的既有异常的多对多关联（仅追加）
+                CREATE TABLE IF NOT EXISTS quality_check_run_anomalies (
+                    run_id     TEXT NOT NULL
+                        REFERENCES quality_check_runs(run_id),
+                    anomaly_id TEXT NOT NULL
+                        REFERENCES quality_anomalies(anomaly_id),
+                    PRIMARY KEY (run_id, anomaly_id)
+                );
+
+                -- 历史不可变：任何 UPDATE/DELETE 直接失败，历史异常与
+                -- 历史检查结果在数据库层面即不可被覆盖或抹除。
+                CREATE TRIGGER IF NOT EXISTS trg_anomalies_no_update
+                    BEFORE UPDATE ON quality_anomalies
+                BEGIN
+                    SELECT RAISE(ABORT, 'quality_anomalies 仅追加，禁止更新');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_anomalies_no_delete
+                    BEFORE DELETE ON quality_anomalies
+                BEGIN
+                    SELECT RAISE(ABORT, 'quality_anomalies 仅追加，禁止删除');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_check_runs_no_update
+                    BEFORE UPDATE ON quality_check_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'quality_check_runs 仅追加，禁止更新');
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_check_runs_no_delete
+                    BEFORE DELETE ON quality_check_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'quality_check_runs 仅追加，禁止删除');
+                END;
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -666,6 +734,174 @@ class SqliteRepository(Repository):
             )
             for r in rows
         ]
+
+
+    # --------------------------------------------------------- 质量异常
+    def insert_anomaly(self, anomaly: QualityAnomaly) -> None:
+        self._conn.execute(
+            "INSERT INTO quality_anomalies(anomaly_id, subject_type, subject_id,"
+            " check_code, level, detail, evidence_json, archivist_id,"
+            " archived_at, fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                anomaly.anomaly_id,
+                anomaly.subject_type,
+                anomaly.subject_id,
+                anomaly.check_code,
+                anomaly.level,
+                anomaly.detail,
+                anomaly.evidence_json,
+                anomaly.archivist_id,
+                anomaly.archived_at,
+                anomaly.fingerprint,
+            ),
+        )
+
+    def _row_to_anomaly(self, row: sqlite3.Row) -> QualityAnomaly:
+        return QualityAnomaly(
+            anomaly_id=row["anomaly_id"],
+            subject_type=row["subject_type"],
+            subject_id=row["subject_id"],
+            check_code=row["check_code"],
+            level=row["level"],
+            detail=row["detail"],
+            evidence_json=row["evidence_json"],
+            archivist_id=row["archivist_id"],
+            archived_at=row["archived_at"],
+            fingerprint=row["fingerprint"],
+        )
+
+    def get_anomaly(self, anomaly_id: str) -> QualityAnomaly | None:
+        row = self._conn.execute(
+            "SELECT * FROM quality_anomalies WHERE anomaly_id = ?", (anomaly_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_anomaly(row)
+
+    def list_anomalies(
+        self,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        level: str | None = None,
+        check_code: str | None = None,
+    ) -> list[QualityAnomaly]:
+        sql = "SELECT * FROM quality_anomalies WHERE 1=1"
+        params: list = []
+        if subject_type is not None:
+            sql += " AND subject_type = ?"
+            params.append(subject_type)
+        if subject_id is not None:
+            sql += " AND subject_id = ?"
+            params.append(subject_id)
+        if level is not None:
+            sql += " AND level = ?"
+            params.append(level)
+        if check_code is not None:
+            sql += " AND check_code = ?"
+            params.append(check_code)
+        sql += " ORDER BY archived_at, anomaly_id"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_anomaly(r) for r in rows]
+
+    def count_anomalies(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM quality_anomalies"
+        ).fetchone()[0]
+
+    # -------------------------------------------------------- 检查结果
+    def insert_check_run(self, run: QualityCheckRun) -> None:
+        self._conn.execute(
+            "INSERT INTO quality_check_runs(run_id, subject_type, subject_id,"
+            " subject_digest, outcome, warning_count, blocking_count, checked_by,"
+            " checked_at, note, fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run.run_id,
+                run.subject_type,
+                run.subject_id,
+                run.subject_digest,
+                run.outcome,
+                run.warning_count,
+                run.blocking_count,
+                run.checked_by,
+                run.checked_at,
+                run.note,
+                run.fingerprint,
+            ),
+        )
+        for anomaly_id in run.anomaly_ids:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO quality_check_run_anomalies(run_id, anomaly_id)"
+                " VALUES(?,?)",
+                (run.run_id, anomaly_id),
+            )
+
+    def _row_to_check_run(
+        self, row: sqlite3.Row, anomaly_ids: tuple[str, ...]
+    ) -> QualityCheckRun:
+        return QualityCheckRun(
+            run_id=row["run_id"],
+            subject_type=row["subject_type"],
+            subject_id=row["subject_id"],
+            subject_digest=row["subject_digest"],
+            outcome=row["outcome"],
+            warning_count=row["warning_count"],
+            blocking_count=row["blocking_count"],
+            checked_by=row["checked_by"],
+            checked_at=row["checked_at"],
+            note=row["note"],
+            anomaly_ids=anomaly_ids,
+            fingerprint=row["fingerprint"],
+        )
+
+    def _run_anomaly_ids(self, run_id: str) -> tuple[str, ...]:
+        rows = self._conn.execute(
+            "SELECT anomaly_id FROM quality_check_run_anomalies WHERE run_id = ?"
+            " ORDER BY anomaly_id",
+            (run_id,),
+        ).fetchall()
+        return tuple(r["anomaly_id"] for r in rows)
+
+    def get_check_run(self, run_id: str) -> QualityCheckRun | None:
+        row = self._conn.execute(
+            "SELECT * FROM quality_check_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_check_run(row, self._run_anomaly_ids(run_id))
+
+    def list_check_runs(
+        self,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+    ) -> list[QualityCheckRun]:
+        sql = "SELECT * FROM quality_check_runs WHERE 1=1"
+        params: list = []
+        if subject_type is not None:
+            sql += " AND subject_type = ?"
+            params.append(subject_type)
+        if subject_id is not None:
+            sql += " AND subject_id = ?"
+            params.append(subject_id)
+        sql += " ORDER BY checked_at, run_id"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_check_run(r, self._run_anomaly_ids(r["run_id"])) for r in rows]
+
+    def count_check_runs(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM quality_check_runs"
+        ).fetchone()[0]
+
+    def latest_run_id(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT run_id FROM quality_check_runs"
+            " ORDER BY checked_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else row["run_id"]
+
+    def insert_check_run_link(self, run_id: str, anomaly_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO quality_check_run_anomalies(run_id, anomaly_id)"
+            " VALUES(?,?)",
+            (run_id, anomaly_id),
+        )
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

@@ -49,3 +49,18 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class QualityLevel(str, Enum):
+    """内容质量异常等级。"""
+
+    WARNING = "warning"    # 警告：记录留痕，不阻断
+    BLOCKING = "blocking"  # 阻断：必须修复并重新检查
+
+
+class CheckOutcome(str, Enum):
+    """一次质量检查的汇总结论（按当次检查内最高等级异常聚合）。"""
+
+    OK = "ok"
+    WARNING = QualityLevel.WARNING.value
+    BLOCKING = QualityLevel.BLOCKING.value

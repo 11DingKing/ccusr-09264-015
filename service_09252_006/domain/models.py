@@ -146,5 +146,49 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class QualityAnomaly:
+    """一次内容质量异常归档。
+
+    异常是归档事件：一经记录即不可变，修复不会更新或删除它。修复后
+    重新检查会产生新的 QualityCheckRun，原异常永远保留在历史中。
+    """
+
+    anomaly_id: str
+    subject_type: str              # material / version / package
+    subject_id: str
+    check_code: str                # 稳定的检查项代码，如 blank_title
+    level: str                     # QualityLevel: warning / blocking
+    detail: str
+    evidence_json: str             # 归档时快照（sha256、版本号等）
+    archivist_id: str              # 归档质检员
+    archived_at: str
+    fingerprint: str = ""          # 归档内容指纹（含 id，全局唯一）
+    # 注：异常行一经写入永不更新；“是否已修复”由后续检查运行的关联
+    # 记录派生（最近一次检查未再发现即视为已修复），不回写本记录。
+
+
+@dataclass
+class QualityCheckRun:
+    """一次质量检查的不可变结果。
+
+    每次执行（含 Python 重跑）都插入新记录；结果永不 UPDATE/覆盖。
+    与归档异常的关联是“当次检查仍发现该异常”，而不是异常的生命周期。
+    """
+
+    run_id: str
+    subject_type: str
+    subject_id: str
+    subject_digest: str            # 被检对象当时的内容指纹
+    outcome: str                   # CheckOutcome: ok / warning / blocking
+    warning_count: int
+    blocking_count: int
+    checked_by: str
+    checked_at: str
+    note: str = ""
+    anomaly_ids: tuple[str, ...] = ()  # 本次发现/关联的既有异常
+    fingerprint: str = ""
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)

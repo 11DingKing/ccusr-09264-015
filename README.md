@@ -46,13 +46,28 @@
 - 截止时间以“当地时间 + IANA 时区”输入，统一换算为 UTC 绝对时刻，正确
   处理跨时区与日界线。
 
+### 内容质量异常（仅追加历史）
+- 质检员把一次问题归档为“内容质量异常”，分 **warning（警告）** 与
+  **blocking（阻断）** 两级；只有 reviewer / quality_authority 可归档。
+- 异常与检查结果是两条**只追加**历史：修复后重新检查产生**新结果**
+  （`outcome=ok`），**不更新、不删除、不覆盖**原异常。数据库层用
+  `BEFORE UPDATE/DELETE` 触发器禁止改写 `quality_anomalies` /
+  `quality_check_runs`。
+- 每次执行检查（含不带幂等键的 Python 重跑）都插入一条新 `check_run`；
+  带相同 `Idempotency-Key` 的重试才回放首次结果。检查结果按等级计数与
+  聚合结论（ok/warning/blocking）落库。
+- 同一未修复问题在多次检查中复用同一条异常并各自关联；修复后再出现
+  （回归）归档为新异常。异常“是否已修复”由最近一次检查关联**派生**，
+  不回写异常行。每条异常/结果带规范化 JSON 指纹，离线核验会重算并检出
+  覆盖或篡改。
+
 ## 分层结构
 
 ```
 service_09252_006/
   domain/        实体、枚举、错误、指纹纯函数、披露策略
-  application/   用例服务（证据/评审包/评审）、端口（Clock、Id、Repository）
-  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址）
+  application/   用例服务（证据/评审包/评审/内容质量异常）、端口（Clock、Id、Repository）
+  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址、仅追加质量历史）
   api/           HTTP 边界（Bearer 鉴权、路由、JSON 编解码）
   cli.py         serve / 离线 verify
 ```
@@ -106,6 +121,12 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/quality/anomalies` | 归档内容质量异常（warning/blocking） |
+| GET  | `/v1/quality/anomalies` | 异常列表（可按对象/等级过滤） |
+| GET  | `/v1/quality/anomalies/{id}` | 单条异常（含派生的 resolved） |
+| POST | `/v1/quality/checks` | 执行质量检查，写入一条新结果 |
+| GET  | `/v1/quality/checks` | 检查结果历史（可按对象过滤） |
+| GET  | `/v1/quality/history` | 某对象的完整异常+检查历史 |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -120,7 +141,8 @@ python3 -m compileall -q service_09252_006 tests
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
-端到端流程。
+多连接**并发复审**、离线核验对字节/清单/评审/质量历史篡改的检出、
+**内容质量异常两级归档与复查不覆盖历史**（含 Python 重跑产生新记录、
+触发器禁止改写、v1→v2 迁移），以及完整 HTTP 端到端流程。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

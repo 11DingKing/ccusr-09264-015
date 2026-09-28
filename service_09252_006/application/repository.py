@@ -16,6 +16,8 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    QualityAnomaly,
+    QualityCheckRun,
     ReviewPackage,
     ReviewRequest,
     User,
@@ -148,3 +150,46 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 内容质量异常与检查结果（仅追加，禁止覆盖） ----
+    @abc.abstractmethod
+    def insert_anomaly(self, anomaly: QualityAnomaly) -> None: ...
+
+    @abc.abstractmethod
+    def get_anomaly(self, anomaly_id: str) -> QualityAnomaly | None: ...
+
+    @abc.abstractmethod
+    def list_anomalies(
+        self,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        level: str | None = None,
+        check_code: str | None = None,
+    ) -> list[QualityAnomaly]: ...
+
+    @abc.abstractmethod
+    def count_anomalies(self) -> int: ...
+
+    @abc.abstractmethod
+    def insert_check_run(self, run: QualityCheckRun) -> None: ...
+
+    @abc.abstractmethod
+    def get_check_run(self, run_id: str) -> QualityCheckRun | None: ...
+
+    @abc.abstractmethod
+    def list_check_runs(
+        self,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+    ) -> list[QualityCheckRun]: ...
+
+    @abc.abstractmethod
+    def count_check_runs(self) -> int: ...
+
+    @abc.abstractmethod
+    def latest_run_id(self) -> str | None: ...
+
+    @abc.abstractmethod
+    def insert_check_run_link(
+        self, run_id: str, anomaly_id: str
+    ) -> None: ...
